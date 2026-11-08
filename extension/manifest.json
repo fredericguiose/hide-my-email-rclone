@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Masquer mon adresse e-mail",
+  "description": "Crée des adresses iCloud Hide My Email en un clic, avec la session rclone du PC.",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlXB9gpHY70+Iteiwmo5nFzdgd9RMa6hMUZ9w5XdFg5a2ctNmSe0xSCgRTHLmXjCI6nirHmELKbGB4T+MH+a3LYv+CL13CBt2gGlIZmAKr8SGoxxL0UcPW94ckGLZ+SMyg7wImXRFZvEQDGA18mtiaGnisMuo79zHaAFel2ZnMOF3t1uvoiySo3KkfBoNRXGocFzyeJAvAApmNlmIYEXNLURX1KiUu/sBzx1I8466UHhpkKYFnrVPsAO+hJemayv/sQFM9ficALdOJLctLIq/I1LjW/FRyE9yZXpluFOYScQ1uQ3dYzigkbTDSYP/xxmVl3caNQ3PSV0YkZuT/+NukQIDAQAB",
+  "permissions": ["nativeMessaging", "contextMenus", "activeTab", "scripting", "clipboardWrite", "notifications"],
+  "background": {"service_worker": "background.js"},
+  "action": {
+    "default_title": "Masquer mon adresse e-mail",
+    "default_popup": "popup/popup.html",
+    "default_icon": {"16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png"}
+  },
+  "icons": {"16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png"}
+}

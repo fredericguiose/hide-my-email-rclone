@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Relais native messaging entre l'extension Chrome et Hide My Email d'iCloud.
+
+Réutilise la session du remote rclone iCloud (cookies) : aucune connexion
+propre, aucun mot de passe lu. N'écrit jamais dans la configuration rclone :
+rclone reste seul maître de la session.
+
+Messages reçus (JSON) : {"cmd": "status" | "generate" | "reserve" | "list", ...}
+Réponse : {"ok": true, ...} ou {"ok": false, "error": <code>, "detail": <texte>}
+Codes d'erreur : session, rclone, apple, network, bad_request.
+"""
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+REMOTE = os.environ.get("HME_RCLONE_REMOTE", "icloud")
+# rclone.conf est chiffré, clé dans le trousseau GNOME (feature cloud-drives).
+# Valeur par défaut au cas où Chrome a été lancé sans environment.d.
+os.environ.setdefault("RCLONE_PASSWORD_COMMAND", "/usr/bin/secret-tool lookup service rclone")
+SETUP_URL = "https://setup.icloud.com/setup/ws/1/validate"
+USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+TIMEOUT = 20
+
+
+class HmeError(Exception):
+    def __init__(self, code, detail=""):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+# ── Native messaging (longueur sur 4 octets + JSON) ─────────────────────────
+
+def read_message():
+    raw = sys.stdin.buffer.read(4)
+    if len(raw) < 4:
+        return None
+    length = struct.unpack("=I", raw)[0]
+    return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+
+
+def send_message(obj):
+    data = json.dumps(obj).encode("utf-8")
+    sys.stdout.buffer.write(struct.pack("=I", len(data)))
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+
+# ── Session rclone ──────────────────────────────────────────────────────────
+
+def rclone_binary():
+    found = shutil.which("rclone")
+    if found:
+        return found
+    for path in ("/usr/bin/rclone", "/usr/local/bin/rclone",
+                 os.path.expanduser("~/.local/bin/rclone")):
+        if os.access(path, os.X_OK):
+            return path
+    raise HmeError("rclone", "rclone introuvable")
+
+
+def rclone_cookies():
+    """Lit les cookies du remote via `rclone config dump` (lecture seule).
+
+    Passer par rclone plutôt que lire le fichier marche aussi quand la
+    configuration est chiffrée (RCLONE_PASSWORD_COMMAND).
+    """
+    try:
+        out = subprocess.run([rclone_binary(), "config", "dump", "--ask-password=false"],
+                             capture_output=True, text=True, timeout=15,
+                             stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise HmeError("rclone", "rclone ne répond pas (configuration chiffrée sans mot de passe ?)")
+    if out.returncode != 0:
+        raise HmeError("rclone", out.stderr.strip()[:200] or "rclone config dump a échoué")
+    remote = json.loads(out.stdout).get(REMOTE)
+    if not remote:
+        raise HmeError("rclone", f"remote « {REMOTE} » absent de la configuration rclone")
+    if remote.get("type") != "iclouddrive":
+        raise HmeError("rclone", f"« {REMOTE} » n'est pas un remote iCloud")
+    cookies = remote.get("cookies", "")
+    if not cookies:
+        raise HmeError("session", "aucune session iCloud dans rclone")
+    return cookies
+
+
+# ── API iCloud ──────────────────────────────────────────────────────────────
+
+class ICloud:
+    def __init__(self, cookies):
+        self.headers = {
+            "Cookie": cookies,
+            "Origin": "https://www.icloud.com",
+            "Referer": "https://www.icloud.com/",
+            "Content-Type": "text/plain",
+            "User-Agent": USER_AGENT,
+        }
+        self.base = None
+
+    def request(self, url, body=None):
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=self.headers,
+                                     method="GET" if body is None else "POST")
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                return resp.status, json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as err:
+            return err.code, None
+        except (urllib.error.URLError, TimeoutError) as err:
+            raise HmeError("network", str(getattr(err, "reason", err)))
+
+    def connect(self):
+        status, data = self.request(SETUP_URL, {})
+        if status in (401, 403, 421):
+            raise HmeError("session", f"session refusée par Apple ({status})")
+        if status != 200 or not data:
+            raise HmeError("apple", f"validation iCloud : HTTP {status}")
+        service = data.get("webservices", {}).get("premiummailsettings", {})
+        if not service.get("url"):
+            raise HmeError("apple", "Hide My Email indisponible (iCloud+ requis)")
+        self.base = service["url"].rstrip("/")
+        dsinfo = data.get("dsInfo", {})
+        return {"name": dsinfo.get("fullName", ""),
+                "appleId": dsinfo.get("primaryEmail") or dsinfo.get("appleId", "")}
+
+    def call(self, path, body=None, versions=("v1",)):
+        """Appelle /<version>/hme/<path>, en essayant les versions dans l'ordre.
+
+        Apple retire les anciennes versions (v1/hme/list répond 410) : on
+        passe à la suivante sur 404/405/410.
+        """
+        last = None
+        for version in versions:
+            status, data = self.request(f"{self.base}/{version}/hme/{path}", body)
+            if status in (401, 403, 421):
+                raise HmeError("session", f"session refusée par Apple ({status})")
+            if status in (404, 405, 410):
+                last = status
+                continue
+            if status != 200 or data is None:
+                raise HmeError("apple", f"{path} : HTTP {status}")
+            if not data.get("success", False):
+                err = data.get("error") or {}
+                raise HmeError("apple", err.get("errorMessage") or err.get("reason") or f"{path} refusé")
+            return data.get("result", {})
+        raise HmeError("apple", f"{path} : aucune version de l'API ne répond ({last})")
+
+
+# ── Commandes ───────────────────────────────────────────────────────────────
+
+def simplify(entry):
+    return {
+        "hme": entry.get("hme", ""),
+        "label": entry.get("label", ""),
+        "note": entry.get("note", ""),
+        "active": bool(entry.get("isActive", False)),
+        "created": entry.get("createTimestamp", 0),
+        "domain": entry.get("domain", ""),
+        "origin": entry.get("origin", ""),
+    }
+
+
+def handle(msg):
+    cmd = (msg or {}).get("cmd")
+    if cmd not in ("status", "generate", "reserve", "list"):
+        raise HmeError("bad_request", f"commande inconnue : {cmd}")
+
+    icloud = ICloud(rclone_cookies())
+    account = icloud.connect()
+
+    if cmd == "status":
+        return {"account": account}
+
+    if cmd == "generate":
+        result = icloud.call("generate", {"langCode": "fr-fr"}, ("v1", "v2"))
+        return {"hme": result.get("hme", "")}
+
+    if cmd == "reserve":
+        hme = str(msg.get("hme", "")).strip()
+        label = str(msg.get("label", "")).strip()[:100]
+        note = str(msg.get("note", "")).strip()[:500]
+        if not hme or not label:
+            raise HmeError("bad_request", "adresse et libellé obligatoires")
+        result = icloud.call("reserve", {"hme": hme, "label": label, "note": note}, ("v1", "v2"))
+        return {"entry": simplify(result.get("hme", {}))}
+
+    result = icloud.call("list", versions=("v2", "v3", "v1"))
+    entries = [simplify(e) for e in result.get("hmeEmails", [])]
+    entries.sort(key=lambda e: e["created"], reverse=True)
+    return {"entries": entries, "forwardTo": result.get("selectedForwardTo", "")}
+
+
+def main():
+    try:
+        msg = read_message()
+    except (ValueError, UnicodeDecodeError):
+        send_message({"ok": False, "error": "bad_request", "detail": "message illisible"})
+        return
+    if msg is None:
+        return
+    try:
+        send_message({"ok": True, **handle(msg)})
+    except HmeError as err:
+        send_message({"ok": False, "error": err.code, "detail": err.detail})
+    except Exception as err:  # dernier filet : l'extension doit toujours recevoir une réponse
+        send_message({"ok": False, "error": "apple", "detail": f"{type(err).__name__}: {err}"[:200]})
+
+
+if __name__ == "__main__":
+    main()
